@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Simple Chat App</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { margin: 0; padding: 20px; font-family: Arial, sans-serif; }
+    .container { display: flex; max-width: 1200px; margin: 0 auto; gap: 20px; }
+    .chat-area { flex: 1; }
+    .sidebar { width: 200px; background: #f5f5f5; padding: 10px; border-radius: 5px; }
+    #messages { list-style-type: none; margin: 0; padding: 0; height: calc(100vh - 200px); overflow-y: auto; }
+    #messages li { padding: 8px 12px; margin-bottom: 5px; border-radius: 5px; }
+    #messages li:nth-child(odd) { background: #e9ecef; }
+    .form-group { margin-bottom: 15px; }
+    .form-group label { display: block; margin-bottom: 5px; }
+    .form-group input { width: 100%; padding: 8px; margin-bottom: 10px; }
+    #chat-form { padding: 10px; background: white; }
+    #message-input { width: 70%; margin-right: 1%; padding: 10px; }
+    #file-input { display: none; }
+    .join-container { max-width: 400px; margin: 40px auto; padding: 20px; background: #f8f9fa; border-radius: 8px; }
+    .btn { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; margin-right: 5px; }
+    .btn-primary { background: #007bff; color: white; }
+    .btn-secondary { background: #6c757d; color: white; }
+    .username { font-weight: bold; color: #2c3e50; }
+    .timestamp { font-size: 0.8em; color: #7f8c8d; }
+    .users-list { list-style: none; padding: 0; }
+    .users-list li { padding: 5px 0; }
+    .room-id { font-size: 0.9em; color: #34495e; margin-bottom: 10px; }
+    .rooms-list { list-style: none; padding: 0; }
+    .rooms-list li { padding: 10px; margin-bottom: 5px; background: #fff; border-radius: 4px; cursor: pointer; }
+    .system-message { color: #666; font-style: italic; }
+  </style>
+</head>
+<body>
+  <!-- Join/Create Form -->
+  <div id="join-form" class="join-container">
+    <h2>Chat Rooms</h2>
+    <div class="form-group">
+      <label for="username-input">Your Name</label>
+      <input type="text" id="username-input" placeholder="Enter your name" required />
+    </div>
+    
+    <div class="form-group">
+      <label for="room-input">Room ID</label>
+      <input type="text" id="room-input" placeholder="Enter room ID" required />
+    </div>
+    
+    <button class="btn btn-primary" id="create-room-btn">Create Room</button>
+    <button class="btn btn-secondary" id="join-room-btn">Join Room</button>
+    
+    <h3>Available Rooms</h3>
+    <ul id="rooms-list" class="rooms-list"></ul>
+  </div>
+
+  <!-- Chat Interface -->
+  <div id="chat-interface" style="display: none;" class="container">
+    <div class="chat-area">
+      <div class="room-id">Room: <span id="current-room"></span></div>
+      <ul id="messages"></ul>
+      <form id="chat-form">
+        <input id="message-input" autocomplete="off" placeholder="Type a message..."/>
+        <button type="button" class="btn btn-secondary" onclick="document.getElementById('file-input').click()">Upload</button>
+        <button type="submit" class="btn btn-primary">Send</button>
+        <input type="file" id="file-input"/>
+      </form>
+    </div>
+    <div class="sidebar">
+      <h3>Online Users</h3>
+      <ul id="users-list" class="users-list"></ul>
+      <button class="btn btn-secondary" id="leave-room-btn" style="margin-top: 20px">Leave Room</button>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    // Initialize socket and variables immediately
+    const socket = io();
+    let currentRoom = '';
+    let currentUsername = '';
+
+    // Get DOM elements
+    const joinForm = document.getElementById('join-form');
+    const chatInterface = document.getElementById('chat-interface');
+    const createRoomBtn = document.getElementById('create-room-btn');
+    const joinRoomBtn = document.getElementById('join-room-btn');
+    const leaveRoomBtn = document.getElementById('leave-room-btn');
+    const chatForm = document.getElementById('chat-form');
+    const messageInput = document.getElementById('message-input');
+    const messages = document.getElementById('messages');
+    const usersList = document.getElementById('users-list');
+    const fileInput = document.getElementById('file-input');
+    
+    // Function definitions
+    function updateRoomsList() {
+      fetch('/api/rooms')
+        .then(response => response.json())
+        .then(rooms => {
+          const roomsList = document.getElementById('rooms-list');
+          roomsList.innerHTML = '';
+          rooms.forEach(room => {
+            const li = document.createElement('li');
+            li.textContent = `Room: ${room.id} (${room.userCount} users)`;
+            li.onclick = () => {
+              document.getElementById('room-input').value = room.id;
+            };
+            roomsList.appendChild(li);
+          });
+        });
+    }
+
+    function createRoom() {
+      const username = document.getElementById('username-input').value.trim();
+      const roomId = document.getElementById('room-input').value.trim();
+      
+      if (!username || !roomId) {
+        alert('Please enter both username and room ID');
+        return;
+      }
+      
+      socket.emit('create-room', { roomId, username });
+    }
+
+    function joinRoom() {
+      const username = document.getElementById('username-input').value.trim();
+      const roomId = document.getElementById('room-input').value.trim();
+      
+      if (!username || !roomId) {
+        alert('Please enter both username and room ID');
+        return;
+      }
+      
+      socket.emit('join-room', { roomId, username });
+    }
+
+    function leaveRoom() {
+      if (currentRoom && currentUsername) {
+        socket.emit('leave-room', { roomId: currentRoom, username: currentUsername });
+        joinForm.style.display = 'block';
+        chatInterface.style.display = 'none';
+        messages.innerHTML = '';
+        currentRoom = '';
+        currentUsername = '';
+      }
+    }
+
+    function updateUsersList(users) {
+      usersList.innerHTML = '';
+      users.forEach(user => {
+        const li = document.createElement('li');
+        li.textContent = user;
+        usersList.appendChild(li);
+      });
+    }
+
+    function uploadFile(file) {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('roomId', currentRoom);
+      
+      fetch('/upload', {
+        method: 'POST',
+        body: formData
+      })
+      .then(response => response.json())
+      .then(data => console.log('File uploaded successfully'))
+      .catch(error => console.error('Error uploading file:', error));
+    }
+
+    // Event Listeners
+    createRoomBtn.addEventListener('click', createRoom);
+    joinRoomBtn.addEventListener('click', joinRoom);
+    leaveRoomBtn.addEventListener('click', leaveRoom);
+    fileInput.addEventListener('change', (e) => uploadFile(e.target.files[0]));
+
+    chatForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      if (messageInput.value) {
+        socket.emit('chat message', {
+          roomId: currentRoom,
+          message: messageInput.value,
+          username: currentUsername
+        });
+        messageInput.value = '';
+      }
+    });
+
+    // Socket event listeners
+    socket.on('room-joined', (data) => {
+      currentRoom = data.roomId;
+      currentUsername = document.getElementById('username-input').value.trim();
+      joinForm.style.display = 'none';
+      chatInterface.style.display = 'flex';
+      document.getElementById('current-room').textContent = data.roomId;
+      updateUsersList(data.users);
+      
+      const li = document.createElement('li');
+      li.textContent = `Welcome to room ${data.roomId}!`;
+      li.className = 'system-message';
+      messages.appendChild(li);
+    });
+
+    socket.on('room-not-found', () => {
+      alert('Room not found. Please create a new room or join an existing one.');
+    });
+
+    socket.on('chat message', (data) => {
+      const li = document.createElement('li');
+      li.innerHTML = `
+        <span class="username">${data.username}</span>
+        <span class="timestamp">${data.timestamp}</span><br>
+        ${data.message}
+      `;
+      messages.appendChild(li);
+      messages.scrollTop = messages.scrollHeight;
+    });
+
+    socket.on('file-shared', (fileInfo) => {
+      const li = document.createElement('li');
+      const link = document.createElement('a');
+      link.href = fileInfo.path;
+      link.textContent = `📎 ${fileInfo.originalname}`;
+      link.download = fileInfo.originalname;
+      li.appendChild(link);
+      messages.appendChild(li);
+      messages.scrollTop = messages.scrollHeight;
+    });
+
+    socket.on('user-joined', (data) => {
+      updateUsersList(data.users);
+      const li = document.createElement('li');
+      li.textContent = `${data.username} joined the room`;
+      li.className = 'system-message';
+      messages.appendChild(li);
+    });
+
+    socket.on('user-left', (data) => {
+      updateUsersList(data.users);
+      const li = document.createElement('li');
+      li.textContent = `${data.username} left the room`;
+      li.className = 'system-message';
+      messages.appendChild(li);
+    });
+
+    // Initialize
+    updateRoomsList();
+    setInterval(updateRoomsList, 5000);
+
+    // Handle page close/refresh
+    window.addEventListener('beforeunload', () => {
+      if (currentRoom && currentUsername) {
+        socket.emit('leave-room', { roomId: currentRoom, username: currentUsername });
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,16 +1,14 @@
 {
-  "name": "webrtc-demo",
-  "version": "0.0.0",
-  "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "serve": "vite preview"
-  },
-  "devDependencies": {
-    "vite": "^2.0.5"
-  },
-  "dependencies": {
-    "firebase": "^8.2.10",
-    "webrtc-demo": "file:"
-  }
+    "name": "simple-chat",
+    "version": "1.0.0",
+    "main": "server.js",
+    "dependencies": {
+        "express": "^4.17.1",
+        "multer": "^1.4.5-lts.1",
+        "simple-chat": "file:",
+        "socket.io": "^4.7.1"
+    },
+    "scripts": {
+        "start": "node server.js"
+    }
 }
