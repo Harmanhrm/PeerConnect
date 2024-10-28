@@ -171,7 +171,38 @@
     joinRoomBtn.addEventListener('click', joinRoom);
     leaveRoomBtn.addEventListener('click', leaveRoom);
     fileInput.addEventListener('change', (e) => uploadFile(e.target.files[0]));
+    // Add this to your existing socket listeners
+socket.on('recent messages', (messages) => {
+  messages.forEach(message => {
+    if (message.type === 'file') {
+      displayFileMessage(message);
+    } else {
+      displayChatMessage(message);
+    }
+  });
+  messages.scrollTop = messages.scrollHeight;
+});
 
+// Helper functions to display messages
+function displayChatMessage(data) {
+  const li = document.createElement('li');
+  li.innerHTML = `
+    <span class="username">${data.username}</span>
+    <span class="timestamp">${data.timestamp}</span><br>
+    ${data.message}
+  `;
+  messages.appendChild(li);
+}
+
+function displayFileMessage(fileInfo) {
+  const li = document.createElement('li');
+  const link = document.createElement('a');
+  link.href = fileInfo.path;
+  link.textContent = `📎 ${fileInfo.originalname}`;
+  link.download = fileInfo.originalname;
+  li.appendChild(link);
+  messages.appendChild(li);
+}
     chatForm.addEventListener('submit', (e) => {
       e.preventDefault();
       if (messageInput.value) {
