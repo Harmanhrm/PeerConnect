@@ -10,39 +10,79 @@ const io = require('socket.io')(http, {
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const bcrypt = require('bcrypt');
+const cookieParser = require('cookie-parser');
+const session = require('express-session');
+
+// Initialize express middleware
+app.use(express.json());
+app.use(cookieParser());
+app.use(session({
+  secret: 'your-secret-key',
+  resave: false,
+  saveUninitialized: true,
+  cookie: { 
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 24 * 60 * 60 * 1000 // 24 hours
+  }
+}));
 
 // Create uploads directory if it doesn't exist
 if (!fs.existsSync('./uploads')){
     fs.mkdirSync('./uploads');
 }
 
-// Set up file storage
+// Secure file upload configuration
 const storage = multer.diskStorage({
   destination: function(req, file, cb) {
     cb(null, './uploads/');
   },
   filename: function(req, file, cb) {
-    cb(null, Date.now() + path.extname(file.originalname));
+    // Add timestamp to prevent filename collisions
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
   }
 });
 
-const upload = multer({ storage: storage });
+const fileFilter = (req, file, cb) => {
+  // Whitelist of allowed file types
+  const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'application/pdf', 'text/plain'];
+  if (allowedTypes.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error('Invalid file type. Only images, PDFs, and text files are allowed.'), false);
+  }
+};
 
-// Improved room management with auto-cleanup
+const upload = multer({ 
+  storage: storage,
+  fileFilter: fileFilter,
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit
+  }
+});
+
+// Enhanced Room class with password protection
 class Room {
-  constructor(id) {
+  constructor(id, passwordHash, createdBy) {
     this.id = id;
-    this.users = new Map(); // socketId -> username
+    this.passwordHash = passwordHash;
+    this.createdBy = createdBy;
+    this.users = new Map(); // socketId -> {username, avatar}
     this.messages = [];
     this.createdAt = new Date();
     this.lastActivity = new Date();
     this.cleanupTimeout = null;
+    this.authorizedUsers = new Set(); // Set of usernames who know the password
   }
 
-  addUser(socketId, username) {
-    this.users.set(socketId, username);
+  async verifyPassword(password) {
+    return await bcrypt.compare(password, this.passwordHash);
+  }
+
+  addUser(socketId, username, avatar = null) {
+    this.users.set(socketId, { username, avatar });
     this.updateActivity();
-    // Clear any existing cleanup timeout
     if (this.cleanupTimeout) {
       clearTimeout(this.cleanupTimeout);
       this.cleanupTimeout = null;
@@ -50,10 +90,18 @@ class Room {
   }
 
   removeUser(socketId) {
-    const username = this.users.get(socketId);
+    const userData = this.users.get(socketId);
     this.users.delete(socketId);
     this.updateActivity();
-    return username;
+    return userData?.username;
+  }
+
+  authorizeUser(username) {
+    this.authorizedUsers.add(username);
+  }
+
+  isUserAuthorized(username) {
+    return this.authorizedUsers.has(username);
   }
 
   updateActivity() {
@@ -61,7 +109,7 @@ class Room {
   }
 
   getUsername(socketId) {
-    return this.users.get(socketId);
+    return this.users.get(socketId)?.username;
   }
 
   getUserCount() {
@@ -69,13 +117,17 @@ class Room {
   }
 
   getAllUsers() {
-    return Array.from(this.users.values());
+    return Array.from(this.users.values()).map(user => user.username);
   }
 
   addMessage(message) {
-    this.messages.push(message);
+    this.messages.push({
+      ...message,
+      timestamp: new Date()
+    });
     this.updateActivity();
-    if (this.messages.length > 50) {
+    // Keep only last 100 messages
+    if (this.messages.length > 100) {
       this.messages.shift();
     }
   }
@@ -92,7 +144,7 @@ class Room {
       if (this.users.size === 0) {
         callback(this.id);
       }
-    }, 60000); // 1 minute
+    }, 3600000); // 1 hour
   }
 
   cleanup() {
@@ -102,80 +154,152 @@ class Room {
   }
 }
 
-// Track active rooms
+// Room and session management
 const rooms = new Map(); // roomId -> Room instance
+const userSessions = new Map(); // sessionId -> {username, authorizedRooms}
 
 // Serve static files
 app.use(express.static('public'));
 app.use('/uploads', express.static('uploads'));
 
-// API endpoint to get available rooms
+// API Routes
 app.get('/api/rooms', (req, res) => {
+  const userSession = userSessions.get(req.sessionID);
+  const authorizedRooms = userSession?.authorizedRooms || [];
+  
   const roomList = Array.from(rooms.entries()).map(([roomId, room]) => ({
     id: roomId,
     userCount: room.getUserCount(),
     createdAt: room.createdAt,
-    lastActivity: room.lastActivity
+    lastActivity: room.lastActivity,
+    isAuthorized: authorizedRooms.includes(roomId),
+    createdBy: room.createdBy
   }));
+  
   res.json(roomList);
 });
 
-// Handle file uploads
-app.post('/upload', upload.single('file'), (req, res) => {
-  if (req.file) {
-    const roomId = req.body.roomId;
-    const fileInfo = {
-      filename: req.file.filename,
-      originalname: req.file.originalname,
-      path: '/uploads/' + req.file.filename,
-      timestamp: new Date().toISOString()
-    };
+app.post('/api/rooms', async (req, res) => {
+  try {
+    const { roomId, password, username } = req.body;
+    
+    if (!roomId || !password || !username) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
     
     if (rooms.has(roomId)) {
-      rooms.get(roomId).addMessage({
-        type: 'file',
-        ...fileInfo
-      });
-      io.to(roomId).emit('file-shared', fileInfo);
+      return res.status(400).json({ error: 'Room already exists' });
     }
+    
+    const passwordHash = await bcrypt.hash(password, 10);
+    const room = new Room(roomId, passwordHash, username);
+    rooms.set(roomId, room);
+    
+    // Authorize creator
+    room.authorizeUser(username);
+    
+    // Update session
+    let userSession = userSessions.get(req.sessionID);
+    if (!userSession) {
+      userSession = { username, authorizedRooms: [] };
+      userSessions.set(req.sessionID, userSession);
+    }
+    userSession.authorizedRooms.push(roomId);
+    
     res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create room' });
   }
 });
 
-// Function to handle room cleanup
-function cleanupRoom(roomId) {
-  const room = rooms.get(roomId);
-  if (room) {
-    room.cleanup();
-    rooms.delete(roomId);
-    io.emit('room-deleted', { roomId });
-    console.log(`Room ${roomId} has been cleaned up due to inactivity`);
-  }
-}
+app.post('/api/rooms/verify', async (req, res) => {
+  try {
+    const { roomId, password, username } = req.body;
+    const room = rooms.get(roomId);
+    
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
 
+    const isValid = await room.verifyPassword(password);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid password' });
+    }
+
+    // Authorize user
+    room.authorizeUser(username);
+    
+    // Update session
+    let userSession = userSessions.get(req.sessionID);
+    if (!userSession) {
+      userSession = { username, authorizedRooms: [] };
+      userSessions.set(req.sessionID, userSession);
+    }
+    if (!userSession.authorizedRooms.includes(roomId)) {
+      userSession.authorizedRooms.push(roomId);
+    }
+    
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Password verification failed' });
+  }
+});
+
+// File upload endpoint
+app.post('/upload', upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const roomId = req.body.roomId;
+    const username = req.body.username;
+    const room = rooms.get(roomId);
+    
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+    
+    if (!room.isUserAuthorized(username)) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const fileInfo = {
+      type: 'file',
+      filename: req.file.filename,
+      originalname: req.file.originalname,
+      path: '/uploads/' + req.file.filename,
+      mimeType: req.file.mimetype,
+      size: req.file.size,
+      username: username,
+      timestamp: new Date().toISOString()
+    };
+    
+    room.addMessage(fileInfo);
+    io.to(roomId).emit('file-shared', fileInfo);
+    res.json({ success: true, file: fileInfo });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Socket.IO event handlers
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
   
   socket.on('create-room', ({ roomId, username }) => {
-    // Prevent username being used as room ID
-    if (!roomId || roomId.trim() === username.trim()) {
-      socket.emit('creation-error', { message: 'Please enter a valid room ID different from your username' });
+    const room = rooms.get(roomId);
+    if (!room || !room.isUserAuthorized(username)) {
+      socket.emit('error', { message: 'Unauthorized to join room' });
       return;
     }
-    
-    if (rooms.has(roomId)) {
-      socket.emit('creation-error', { message: 'Room ID already exists' });
-      return;
-    }
-    
-    const room = new Room(roomId);
-    rooms.set(roomId, room);
     handleJoinRoom(socket, roomId, username);
   });
 
   socket.on('join-room', ({ roomId, username }) => {
-    if (!rooms.has(roomId)) {
-      socket.emit('room-not-found');
+    const room = rooms.get(roomId);
+    if (!room || !room.isUserAuthorized(username)) {
+      socket.emit('error', { message: 'Unauthorized to join room' });
       return;
     }
     handleJoinRoom(socket, roomId, username);
@@ -185,23 +309,24 @@ io.on('connection', (socket) => {
     handleLeaveRoom(socket, roomId, username);
   });
 
-  socket.on('chat message', ({ roomId, message }) => {
+  socket.on('chat message', ({ roomId, message, username }) => {
     const room = rooms.get(roomId);
-    if (room) {
-      const username = room.getUsername(socket.id);
-      const messageData = {
-        type: 'message',
-        message,
-        username,
-        timestamp: new Date().toLocaleTimeString()
-      };
-      room.addMessage(messageData);
-      io.to(roomId).emit('chat message', messageData);
+    if (!room || !room.isUserAuthorized(username)) {
+      return;
     }
+
+    const messageData = {
+      type: 'message',
+      content: message,
+      username: username,
+      timestamp: new Date().toISOString()
+    };
+
+    room.addMessage(messageData);
+    io.to(roomId).emit('chat message', messageData);
   });
 
   socket.on('disconnect', () => {
-    // Handle disconnection for all rooms this socket was in
     socket.rooms.forEach(roomId => {
       if (rooms.has(roomId)) {
         const room = rooms.get(roomId);
@@ -212,7 +337,6 @@ io.on('connection', (socket) => {
             users: room.getAllUsers()
           });
           
-          // Start cleanup timer if room is empty
           if (room.getUserCount() === 0) {
             room.startCleanupTimer(cleanupRoom);
           }
@@ -223,6 +347,7 @@ io.on('connection', (socket) => {
   });
 });
 
+// Helper functions
 function handleJoinRoom(socket, roomId, username) {
   const room = rooms.get(roomId);
   if (!room) return;
@@ -230,15 +355,14 @@ function handleJoinRoom(socket, roomId, username) {
   socket.join(roomId);
   room.addUser(socket.id, username);
 
-  socket.emit('recent messages', room.getRecentMessages());
-  
-  io.to(roomId).emit('user-joined', {
-    username,
-    users: room.getAllUsers()
-  });
-  
   socket.emit('room-joined', {
     roomId,
+    users: room.getAllUsers(),
+    messages: room.getRecentMessages()
+  });
+
+  io.to(roomId).emit('user-joined', {
+    username,
     users: room.getAllUsers()
   });
 }
@@ -247,21 +371,39 @@ function handleLeaveRoom(socket, roomId, username) {
   const room = rooms.get(roomId);
   if (!room) return;
 
-  if (!username) return;
-
   socket.leave(roomId);
+  room.removeUser(socket.id);
   
   io.to(roomId).emit('user-left', {
     username,
     users: room.getAllUsers()
   });
   
-  // Start cleanup timer if room is empty
   if (room.getUserCount() === 0) {
     room.startCleanupTimer(cleanupRoom);
   }
   
   socket.emit('room-left');
+}
+
+function cleanupRoom(roomId) {
+  const room = rooms.get(roomId);
+  if (room) {
+    room.cleanup();
+    rooms.delete(roomId);
+    io.emit('room-deleted', { roomId });
+    
+    // Clean up uploaded files
+    const uploadsDir = './uploads';
+    fs.readdir(uploadsDir, (err, files) => {
+      if (err) return;
+      files.forEach(file => {
+        fs.unlink(path.join(uploadsDir, file), err => {
+          if (err) console.error('Error deleting file:', err);
+        });
+      });
+    });
+  }
 }
 
 const PORT = process.env.PORT || 3000;
