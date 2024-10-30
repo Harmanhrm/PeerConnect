@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: simple-chat
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 3000
+    disk:
+      name: uploads
+      mountPath: /uploads
+      sizeGB: 1
