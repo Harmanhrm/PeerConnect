@@ -1,7 +1,7 @@
 # Secure Chat Rooms
 
 A real-time chat application with secure rooms, password protection, and file sharing capabilities built with Node.js, Socket.IO, and Express.
-Currently Hosted on render.com
+Currently Hosted on render.com at https://simple-chat-25h0.onrender.com/
 
 ## Features
 
